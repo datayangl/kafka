@@ -48,6 +48,7 @@ import org.apache.kafka.common.config.types.Password;
 import org.apache.kafka.common.security.auth.SslEngineFactory;
 import org.apache.kafka.common.security.ssl.DefaultSslEngineFactory;
 import org.bouncycastle.asn1.DEROctetString;
+import org.bouncycastle.asn1.DERSequence;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
 import org.bouncycastle.asn1.x509.Extension;
@@ -212,8 +213,11 @@ public class TestSslUtils {
             this.algorithm = algorithm;
         }
 
-        public CertificateBuilder sanDnsName(String hostName) throws IOException {
-            subjectAltName = new GeneralNames(new GeneralName(GeneralName.dNSName, hostName)).getEncoded();
+        public CertificateBuilder sanDnsNames(String... hostNames) throws IOException {
+            GeneralName[] altNames = new GeneralName[hostNames.length];
+            for (int i = 0; i < hostNames.length; i++)
+                altNames[i] = new GeneralName(GeneralName.dNSName, hostNames[i]);
+            subjectAltName = GeneralNames.getInstance(new DERSequence(altNames)).getEncoded();
             return this;
         }
 
@@ -367,6 +371,8 @@ public class TestSslUtils {
 
     public static final class TestSslEngineFactory implements SslEngineFactory {
 
+        public boolean closed = false;
+
         DefaultSslEngineFactory defaultSslEngineFactory = new DefaultSslEngineFactory();
 
         @Override
@@ -402,6 +408,7 @@ public class TestSslUtils {
         @Override
         public void close() throws IOException {
             defaultSslEngineFactory.close();
+            closed = true;
         }
 
         @Override

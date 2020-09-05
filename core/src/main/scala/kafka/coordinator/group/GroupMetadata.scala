@@ -159,7 +159,8 @@ private object GroupMetadata extends Logging {
  * Case class used to represent group metadata for the ListGroups API
  */
 case class GroupOverview(groupId: String,
-                         protocolType: String)
+                         protocolType: String,
+                         state: String)
 
 /**
  * Case class used to represent group metadata for the DescribeGroup API
@@ -353,7 +354,7 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
 
   def currentState = state
 
-  def notYetRejoinedMembers = members.values.filter(!_.isAwaitingJoin).toList
+  def notYetRejoinedMembers = members.filter(!_._2.isAwaitingJoin).toMap
 
   def hasAllMembersJoined = members.size == numMembersAwaitingJoin && pendingMembers.isEmpty
 
@@ -361,7 +362,17 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
 
   def allStaticMembers = staticMembers.keySet
 
+  // For testing only.
+  def allDynamicMembers = {
+    val dynamicMemberSet = new mutable.HashSet[String]
+    allMembers.foreach(memberId => dynamicMemberSet.add(memberId))
+    staticMembers.values.foreach(memberId => dynamicMemberSet.remove(memberId))
+    dynamicMemberSet.toSet
+  }
+
   def numPending = pendingMembers.size
+
+  def numAwaiting: Int = numMembersAwaitingJoin
 
   def allMemberMetadata = members.values.toList
 
@@ -560,7 +571,7 @@ private[group] class GroupMetadata(val groupId: String, initialState: GroupState
   }
 
   def overview: GroupOverview = {
-    GroupOverview(groupId, protocolType.getOrElse(""))
+    GroupOverview(groupId, protocolType.getOrElse(""), state.toString)
   }
 
   def initializeOffsets(offsets: collection.Map[TopicPartition, CommitRecordMetadataAndOffset],

@@ -35,7 +35,7 @@ import org.apache.kafka.common.protocol.{ApiKeys, Errors}
 import org.apache.kafka.common.requests._
 import org.apache.kafka.common.utils.Time
 
-import scala.collection.{Map, Seq, immutable, mutable}
+import scala.collection.{Map, Seq, Set, immutable, mutable}
 import scala.math.max
 
 /**
@@ -124,6 +124,35 @@ class GroupCoordinator(val brokerId: Int,
     info("Shutdown complete.")
   }
 
+  /**
+   * Verify if the group has space to accept the joining member. The various
+   * criteria are explained below.
+   */
+  private def acceptJoiningMember(group: GroupMetadata, member: String): Boolean = {
+    group.currentState match {
+      // Always accept the request when the group is empty or dead
+      case Empty | Dead =>
+        true
+
+      // An existing member is accepted if it is already awaiting. New members are accepted
+      // up to the max group size. Note that the number of awaiting members is used here
+      // for two reasons:
+      // 1) the group size is not reliable as it could already be above the max group size
+      //    if the max group size was reduced.
+      // 2) using the number of awaiting members allows to kick out the last rejoining
+      //    members of the group.
+      case PreparingRebalance =>
+        (group.has(member) && group.get(member).isAwaitingJoin) ||
+          group.numAwaiting < groupConfig.groupMaxSize
+
+      // An existing member is accepted. New members are accepted up to the max group size.
+      // Note that the group size is used here. When the group transitions to CompletingRebalance,
+      // members which haven't rejoined are removed.
+      case CompletingRebalance | Stable =>
+        group.has(member) || group.size < groupConfig.groupMaxSize
+    }
+  }
+
   def handleJoinGroup(groupId: String,
                       memberId: String,
                       groupInstanceId: Option[String],
@@ -152,9 +181,7 @@ class GroupCoordinator(val brokerId: Int,
           responseCallback(JoinGroupResult(memberId, Errors.UNKNOWN_MEMBER_ID))
         case Some(group) =>
           group.inLock {
-            if ((groupIsOverCapacity(group)
-                  && group.has(memberId) && !group.get(memberId).isAwaitingJoin) // oversized group, need to shed members that haven't joined yet
-                || (isUnknownMember && group.size >= groupConfig.groupMaxSize)) {
+            if (!acceptJoiningMember(group, memberId)) {
               group.remove(memberId)
               group.removeStaticMember(groupInstanceId)
               responseCallback(JoinGroupResult(JoinGroupRequest.UNKNOWN_MEMBER_ID, Errors.GROUP_MAX_SIZE_REACHED))
@@ -770,12 +797,17 @@ class GroupCoordinator(val brokerId: Int,
     }
   }
 
-  def handleListGroups(): (Errors, List[GroupOverview]) = {
+  def handleListGroups(states: Set[String]): (Errors, List[GroupOverview]) = {
     if (!isActive.get) {
       (Errors.COORDINATOR_NOT_AVAILABLE, List[GroupOverview]())
     } else {
       val errorCode = if (groupManager.isLoading) Errors.COORDINATOR_LOAD_IN_PROGRESS else Errors.NONE
-      (errorCode, groupManager.currentGroups.map(_.overview).toList)
+      // if states is empty, return all groups
+      val groups = if (states.isEmpty)
+        groupManager.currentGroups
+      else
+        groupManager.currentGroups.filter(g => states.contains(g.summary.state))
+      (errorCode, groups.map(_.overview).toList)
     }
   }
 
@@ -1051,7 +1083,8 @@ class GroupCoordinator(val brokerId: Int,
     }
   }
 
-  private def prepareRebalance(group: GroupMetadata, reason: String): Unit = {
+  // package private for testing
+  private[group] def prepareRebalance(group: GroupMetadata, reason: String): Unit = {
     // if any members are awaiting sync, cancel their request and have them rejoin
     if (group.is(CompletingRebalance))
       resetAndPropagateAssignmentError(group, Errors.REBALANCE_IN_PROGRESS)
@@ -1113,12 +1146,16 @@ class GroupCoordinator(val brokerId: Int,
 
   def onCompleteJoin(group: GroupMetadata): Unit = {
     group.inLock {
-      // remove dynamic members who haven't joined the group yet
-      group.notYetRejoinedMembers.filterNot(_.isStaticMember) foreach { failedMember =>
-        removeHeartbeatForLeavingMember(group, failedMember)
-        group.remove(failedMember.memberId)
-        group.removeStaticMember(failedMember.groupInstanceId)
-        // TODO: cut the socket connection to the client
+      val notYetRejoinedDynamicMembers = group.notYetRejoinedMembers.filterNot(_._2.isStaticMember)
+      if (notYetRejoinedDynamicMembers.nonEmpty) {
+        info(s"Group ${group.groupId} remove dynamic members " +
+          s"who haven't joined: ${notYetRejoinedDynamicMembers.keySet}")
+
+        notYetRejoinedDynamicMembers.values foreach { failedMember =>
+          removeHeartbeatForLeavingMember(group, failedMember)
+          group.remove(failedMember.memberId)
+          // TODO: cut the socket connection to the client
+        }
       }
 
       if (group.is(Dead)) {

@@ -89,6 +89,8 @@ class SocketServerTest {
     // Run the tests with TRACE logging to exercise request logging path
     logLevelToRestore = kafkaLogger.getLevel
     kafkaLogger.setLevel(Level.TRACE)
+
+    assertTrue(server.controlPlaneRequestChannelOpt.isEmpty)
   }
 
   @After
@@ -170,7 +172,7 @@ class SocketServerTest {
   }
 
   private def sslClientSocket(port: Int): Socket = {
-    val sslContext = SSLContext.getInstance("TLSv1.2")
+    val sslContext = SSLContext.getInstance(TestSslUtils.DEFAULT_TLS_PROTOCOL_FOR_TESTS)
     sslContext.init(null, Array(TestUtils.trustAllCerts), new java.security.SecureRandom())
     val socketFactory = sslContext.getSocketFactory
     val socket = socketFactory.createSocket("localhost", port)
@@ -303,6 +305,7 @@ class SocketServerTest {
     val config = KafkaConfig.fromProps(testProps)
     val testableServer = new TestableSocketServer(config)
     testableServer.startup(startProcessingRequests = false)
+
     val updatedEndPoints = config.advertisedListeners.map { endpoint =>
       endpoint.copy(port = testableServer.boundPort(endpoint.listenerName))
     }.map(_.toJava)
@@ -368,21 +371,6 @@ class SocketServerTest {
     sendRequest(socket2, producerRequestBytes())
 
     testableServer.shutdown()
-  }
-
-  @Test
-  def testControlPlaneRequest(): Unit = {
-    val testProps = new Properties
-    testProps ++= props
-    testProps.put("listeners", "PLAINTEXT://localhost:0,CONTROLLER://localhost:0")
-    testProps.put("listener.security.protocol.map", "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT")
-    testProps.put("control.plane.listener.name", "CONTROLLER")
-    val config = KafkaConfig.fromProps(testProps)
-    withTestableServer(config, { testableServer =>
-      val socket = connect(testableServer, config.controlPlaneListenerName.get,
-        localAddr = InetAddress.getLocalHost)
-      sendAndReceiveControllerRequest(socket, testableServer)
-    })
   }
 
   @Test
@@ -509,10 +497,10 @@ class SocketServerTest {
     val overrideConnectionId = "127.0.0.1:1-127.0.0.1:2-0"
     val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, time, credentialProvider) {
       override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
-                                protocol: SecurityProtocol, memoryPool: MemoryPool): Processor = {
+                                protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, dataPlaneRequestChannel, connectionQuotas,
           config.connectionsMaxIdleMs, config.failedAuthenticationDelayMs, listenerName, protocol, config, metrics,
-          credentialProvider, memoryPool, new LogContext()) {
+          credentialProvider, memoryPool, new LogContext(), isPrivilegedListener = isPrivilegedListener) {
             override protected[network] def connectionId(socket: Socket): String = overrideConnectionId
             override protected[network] def createSelector(channelBuilder: ChannelBuilder): Selector = {
              val testableSelector = new TestableSelector(config, channelBuilder, time, metrics)
@@ -1009,10 +997,10 @@ class SocketServerTest {
     var conn: Socket = null
     val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider) {
       override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
-                                protocol: SecurityProtocol, memoryPool: MemoryPool): Processor = {
+                                protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, dataPlaneRequestChannel, connectionQuotas,
           config.connectionsMaxIdleMs, config.failedAuthenticationDelayMs, listenerName, protocol, config, metrics,
-          credentialProvider, MemoryPool.NONE, new LogContext()) {
+          credentialProvider, MemoryPool.NONE, new LogContext(), isPrivilegedListener = isPrivilegedListener) {
           override protected[network] def sendResponse(response: RequestChannel.Response, responseSend: Send): Unit = {
             conn.close()
             super.sendResponse(response, responseSend)
@@ -1049,10 +1037,10 @@ class SocketServerTest {
     @volatile var selector: TestableSelector = null
     val overrideServer = new SocketServer(KafkaConfig.fromProps(props), serverMetrics, Time.SYSTEM, credentialProvider) {
       override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
-                                protocol: SecurityProtocol, memoryPool: MemoryPool): Processor = {
+                                protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
         new Processor(id, time, config.socketRequestMaxBytes, dataPlaneRequestChannel, connectionQuotas,
           config.connectionsMaxIdleMs, config.failedAuthenticationDelayMs, listenerName, protocol, config, metrics,
-          credentialProvider, memoryPool, new LogContext()) {
+          credentialProvider, memoryPool, new LogContext(), isPrivilegedListener = isPrivilegedListener) {
           override protected[network] def createSelector(channelBuilder: ChannelBuilder): Selector = {
            val testableSelector = new TestableSelector(config, channelBuilder, time, metrics)
            selector = testableSelector
@@ -1464,6 +1452,9 @@ class SocketServerTest {
     props ++= sslServerProps
     val testableServer = new TestableSocketServer(time = time)
     testableServer.startup()
+
+    assertTrue(testableServer.controlPlaneRequestChannelOpt.isEmpty)
+
     val proxyServer = new ProxyServer(testableServer)
     try {
       val testableSelector = testableServer.testableSelector
@@ -1597,6 +1588,8 @@ class SocketServerTest {
       testableSelector.waitForOperations(SelectorOperation.Poll, 1)
 
       testableSelector.waitForOperations(SelectorOperation.CloseSelector, 1)
+      assertEquals(1, testableServer.uncaughtExceptions)
+      testableServer.uncaughtExceptions = 0
     })
   }
 
@@ -1659,6 +1652,75 @@ class SocketServerTest {
     }
   }
 
+
+  @Test
+  def testControlPlaneAsPrivilegedListener(): Unit = {
+    val testProps = new Properties
+    testProps ++= props
+    testProps.put("listeners", "PLAINTEXT://localhost:0,CONTROLLER://localhost:0")
+    testProps.put("listener.security.protocol.map", "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT")
+    testProps.put("control.plane.listener.name", "CONTROLLER")
+    val config = KafkaConfig.fromProps(testProps)
+    withTestableServer(config, { testableServer =>
+      val controlPlaneSocket = connect(testableServer, config.controlPlaneListenerName.get,
+        localAddr = InetAddress.getLocalHost)
+      val sentRequest = sendAndReceiveControllerRequest(controlPlaneSocket, testableServer)
+      assertTrue(sentRequest.context.fromPrivilegedListener)
+
+      val plainSocket = connect(testableServer, localAddr = InetAddress.getLocalHost)
+      val plainRequest = sendAndReceiveRequest(plainSocket, testableServer)
+      assertFalse(plainRequest.context.fromPrivilegedListener)
+    })
+  }
+
+  @Test
+  def testInterBrokerListenerAsPrivilegedListener(): Unit = {
+    val testProps = new Properties
+    testProps ++= props
+    testProps.put("listeners", "EXTERNAL://localhost:0,INTERNAL://localhost:0")
+    testProps.put("listener.security.protocol.map", "EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT")
+    testProps.put("inter.broker.listener.name", "INTERNAL")
+    val config = KafkaConfig.fromProps(testProps)
+    withTestableServer(config, { testableServer =>
+      val interBrokerSocket = connect(testableServer, config.interBrokerListenerName,
+        localAddr = InetAddress.getLocalHost)
+      val sentRequest = sendAndReceiveRequest(interBrokerSocket, testableServer)
+      assertTrue(sentRequest.context.fromPrivilegedListener)
+
+      val externalSocket = connect(testableServer, new ListenerName("EXTERNAL"),
+        localAddr = InetAddress.getLocalHost)
+      val externalRequest = sendAndReceiveRequest(externalSocket, testableServer)
+      assertFalse(externalRequest.context.fromPrivilegedListener)
+    })
+  }
+
+  @Test
+  def testControlPlaneTakePrecedenceOverInterBrokerListenerAsPrivilegedListener(): Unit = {
+    val testProps = new Properties
+    testProps ++= props
+    testProps.put("listeners", "EXTERNAL://localhost:0,INTERNAL://localhost:0,CONTROLLER://localhost:0")
+    testProps.put("listener.security.protocol.map", "EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT")
+    testProps.put("control.plane.listener.name", "CONTROLLER")
+    testProps.put("inter.broker.listener.name", "INTERNAL")
+    val config = KafkaConfig.fromProps(testProps)
+    withTestableServer(config, { testableServer =>
+      val controlPlaneSocket = connect(testableServer, config.controlPlaneListenerName.get,
+        localAddr = InetAddress.getLocalHost)
+      val controlPlaneRequest = sendAndReceiveControllerRequest(controlPlaneSocket, testableServer)
+      assertTrue(controlPlaneRequest.context.fromPrivilegedListener)
+
+      val interBrokerSocket = connect(testableServer, config.interBrokerListenerName,
+        localAddr = InetAddress.getLocalHost)
+      val interBrokerRequest = sendAndReceiveRequest(interBrokerSocket, testableServer)
+      assertFalse(interBrokerRequest.context.fromPrivilegedListener)
+
+      val externalSocket = connect(testableServer, new ListenerName("EXTERNAL"),
+        localAddr = InetAddress.getLocalHost)
+      val externalRequest = sendAndReceiveRequest(externalSocket, testableServer)
+      assertFalse(externalRequest.context.fromPrivilegedListener)
+    })
+  }
+
   private def sslServerProps: Properties = {
     val trustStoreFile = File.createTempFile("truststore", ".jks")
     val sslProps = TestUtils.createBrokerConfig(0, TestUtils.MockZkConnect, interBrokerSecurityProtocol = Some(SecurityProtocol.SSL),
@@ -1675,6 +1737,7 @@ class SocketServerTest {
         testWithServer(testableServer)
     } finally {
       shutdownServerAndMetrics(testableServer)
+      assertEquals(0, testableServer.uncaughtExceptions)
     }
   }
 
@@ -1730,17 +1793,24 @@ class SocketServerTest {
       new Metrics, time, credentialProvider) {
 
     @volatile var selector: Option[TestableSelector] = None
+    @volatile var uncaughtExceptions = 0
 
     override def newProcessor(id: Int, requestChannel: RequestChannel, connectionQuotas: ConnectionQuotas, listenerName: ListenerName,
-                                protocol: SecurityProtocol, memoryPool: MemoryPool): Processor = {
+                              protocol: SecurityProtocol, memoryPool: MemoryPool, isPrivilegedListener: Boolean = false): Processor = {
       new Processor(id, time, config.socketRequestMaxBytes, requestChannel, connectionQuotas, config.connectionsMaxIdleMs,
         config.failedAuthenticationDelayMs, listenerName, protocol, config, metrics, credentialProvider,
-        memoryPool, new LogContext(), connectionQueueSize) {
+        memoryPool, new LogContext(), connectionQueueSize, isPrivilegedListener) {
 
         override protected[network] def createSelector(channelBuilder: ChannelBuilder): Selector = {
            val testableSelector = new TestableSelector(config, channelBuilder, time, metrics, metricTags.asScala)
            selector = Some(testableSelector)
            testableSelector
+        }
+
+        override private[network] def processException(errorMessage: String, throwable: Throwable): Unit = {
+          if (errorMessage.contains("uncaught exception"))
+            uncaughtExceptions += 1
+          super.processException(errorMessage, throwable)
         }
       }
     }
@@ -1794,12 +1864,19 @@ class SocketServerTest {
     // Enable data from `Selector.poll()` to be deferred to a subsequent poll() until
     // the number of elements of that type reaches `minPerPoll`. This enables tests to verify
     // that failed processing doesn't impact subsequent processing within the same iteration.
-    class PollData[T] {
+    abstract class PollData[T] {
       var minPerPoll = 1
       val deferredValues = mutable.Buffer[T]()
-      val currentPollValues = mutable.Buffer[T]()
-      def update(newValues: mutable.Buffer[T]): Unit = {
-        if (currentPollValues.nonEmpty || deferredValues.size + newValues.size >= minPerPoll) {
+
+      /**
+       * Process new results and return the results for the current poll if at least
+       * `minPerPoll` results are available including any deferred results. Otherwise
+       * add the provided values to the deferred set and return an empty buffer. This allows
+       * tests to process `minPerPoll` elements as the results of a single poll iteration.
+       */
+      protected def update(newValues: mutable.Buffer[T]): mutable.Buffer[T] = {
+        val currentPollValues = mutable.Buffer[T]()
+        if (deferredValues.size + newValues.size >= minPerPoll) {
           if (deferredValues.nonEmpty) {
             currentPollValues ++= deferredValues
             deferredValues.clear()
@@ -1807,14 +1884,49 @@ class SocketServerTest {
           currentPollValues ++= newValues
         } else
           deferredValues ++= newValues
+
+        currentPollValues
       }
-      def reset(): Unit = {
-        currentPollValues.clear()
+
+      /**
+       * Process results from the appropriate buffer in Selector and update the buffer to either
+       * defer and return nothing or return all results including previously deferred values.
+       */
+      def updateResults(): Unit
+    }
+
+    class CompletedReceivesPollData(selector: TestableSelector) extends PollData[NetworkReceive] {
+      val completedReceivesMap: util.Map[String, NetworkReceive] = JTestUtils.fieldValue(selector, classOf[Selector], "completedReceives")
+
+      override def updateResults(): Unit = {
+        val currentReceives = update(selector.completedReceives.asScala.toBuffer)
+        completedReceivesMap.clear()
+        currentReceives.foreach { receive =>
+          val channelOpt = Option(selector.channel(receive.source)).orElse(Option(selector.closingChannel(receive.source)))
+          channelOpt.foreach { channel => completedReceivesMap.put(channel.id, receive) }
+        }
       }
     }
-    val cachedCompletedReceives = new PollData[NetworkReceive]()
-    val cachedCompletedSends = new PollData[Send]()
-    val cachedDisconnected = new PollData[(String, ChannelState)]()
+
+    class CompletedSendsPollData(selector: TestableSelector) extends PollData[Send] {
+      override def updateResults(): Unit = {
+        val currentSends = update(selector.completedSends.asScala)
+        selector.completedSends.clear()
+        currentSends.foreach { selector.completedSends.add }
+      }
+    }
+
+    class DisconnectedPollData(selector: TestableSelector) extends PollData[(String, ChannelState)] {
+      override def updateResults(): Unit = {
+        val currentDisconnected = update(selector.disconnected.asScala.toBuffer)
+        selector.disconnected.clear()
+        currentDisconnected.foreach { case (channelId, state) => selector.disconnected.put(channelId, state) }
+      }
+    }
+
+    val cachedCompletedReceives = new CompletedReceivesPollData(this)
+    val cachedCompletedSends = new CompletedSendsPollData(this)
+    val cachedDisconnected = new DisconnectedPollData(this)
     val allCachedPollData = Seq(cachedCompletedReceives, cachedCompletedSends, cachedDisconnected)
     val pendingClosingChannels = new ConcurrentLinkedQueue[KafkaChannel]()
     @volatile var minWakeupCount = 0
@@ -1861,20 +1973,23 @@ class SocketServerTest {
 
     override def poll(timeout: Long): Unit = {
       try {
+        assertEquals(0, super.completedReceives().size)
+        assertEquals(0, super.completedSends().size)
+
         pollCallback.apply()
         while (!pendingClosingChannels.isEmpty) {
           makeClosing(pendingClosingChannels.poll())
         }
-        allCachedPollData.foreach(_.reset)
         runOp(SelectorOperation.Poll, None) {
           super.poll(pollTimeoutOverride.getOrElse(timeout))
         }
       } finally {
-        super.channels.asScala.foreach(allChannels += _.id)
+        super.channels.forEach(allChannels += _.id)
         allDisconnectedChannels ++= super.disconnected.asScala.keys
-        cachedCompletedReceives.update(super.completedReceives.asScala.toBuffer)
-        cachedCompletedSends.update(super.completedSends.asScala)
-        cachedDisconnected.update(super.disconnected.asScala.toBuffer)
+
+        cachedCompletedReceives.updateResults()
+        cachedCompletedSends.updateResults()
+        cachedDisconnected.updateResults()
       }
     }
 
@@ -1898,12 +2013,6 @@ class SocketServerTest {
           super.wakeup()
       }
     }
-
-    override def disconnected: java.util.Map[String, ChannelState] = cachedDisconnected.currentPollValues.toMap.asJava
-
-    override def completedSends: java.util.List[Send] = cachedCompletedSends.currentPollValues.asJava
-
-    override def completedReceives: java.util.List[NetworkReceive] = cachedCompletedReceives.currentPollValues.asJava
 
     override def close(id: String): Unit = {
       runOp(SelectorOperation.Close, Some(id)) {

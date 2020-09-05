@@ -59,6 +59,7 @@ import java.util.List;
 import java.util.Properties;
 import java.util.stream.Collectors;
 
+import static org.apache.kafka.streams.integration.utils.IntegrationTestUtils.safeUniqueTestName;
 import static org.hamcrest.CoreMatchers.is;
 import static org.hamcrest.MatcherAssert.assertThat;
 
@@ -71,8 +72,6 @@ public class MetricsIntegrationTest {
     @ClassRule
     public static final EmbeddedKafkaCluster CLUSTER = new EmbeddedKafkaCluster(NUM_BROKERS);
     private final long timeout = 60000;
-
-    private final static String APPLICATION_ID_VALUE = "stream-metrics-test";
 
     // Metric group
     private static final String STREAM_CLIENT_NODE_METRICS = "stream-metrics";
@@ -205,6 +204,9 @@ public class MetricsIntegrationTest {
     private static final String SUPPRESSION_BUFFER_COUNT_MAX = "suppression-buffer-count-max";
     private static final String EXPIRED_WINDOW_RECORD_DROP_RATE = "expired-window-record-drop-rate";
     private static final String EXPIRED_WINDOW_RECORD_DROP_TOTAL = "expired-window-record-drop-total";
+    private static final String RECORD_E2E_LATENCY_AVG = "record-e2e-latency-avg";
+    private static final String RECORD_E2E_LATENCY_MIN = "record-e2e-latency-min";
+    private static final String RECORD_E2E_LATENCY_MAX = "record-e2e-latency-max";
 
     // stores name
     private static final String TIME_WINDOWED_AGGREGATED_STREAM_STORE = "time-windowed-aggregated-stream-store";
@@ -227,14 +229,15 @@ public class MetricsIntegrationTest {
     private String appId;
 
     @Rule
-    public TestName name = new TestName();
+    public TestName testName = new TestName();
 
     @Before
     public void before() throws InterruptedException {
         builder = new StreamsBuilder();
         CLUSTER.createTopics(STREAM_INPUT, STREAM_OUTPUT_1, STREAM_OUTPUT_2, STREAM_OUTPUT_3, STREAM_OUTPUT_4);
 
-        appId = APPLICATION_ID_VALUE + "-" + name.getMethodName();
+        final String safeTestName = safeUniqueTestName(getClass(), testName);
+        appId = "app-" + safeTestName;
 
         streamsConfiguration = new Properties();
         streamsConfiguration.put(StreamsConfig.APPLICATION_ID_CONFIG, appId);
@@ -271,7 +274,7 @@ public class MetricsIntegrationTest {
         verifyStateMetric(State.RUNNING);
     }
 
-    private void produceRecordsForTwoSegments(final Duration segmentInterval) throws Exception {
+    private void produceRecordsForTwoSegments(final Duration segmentInterval) {
         final MockTime mockTime = new MockTime(Math.max(segmentInterval.toMillis(), 60_000L));
         final Properties props = TestUtils.producerConfig(
             CLUSTER.bootstrapServers(),
@@ -292,7 +295,7 @@ public class MetricsIntegrationTest {
         );
     }
 
-    private void produceRecordsForClosingWindow(final Duration windowSize) throws Exception {
+    private void produceRecordsForClosingWindow(final Duration windowSize) {
         final MockTime mockTime = new MockTime(windowSize.toMillis() + 1);
         final Properties props = TestUtils.producerConfig(
             CLUSTER.bootstrapServers(),
@@ -582,6 +585,8 @@ public class MetricsIntegrationTest {
         final int numberOfRemovedMetrics = StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? 18 : 0;
         final int numberOfModifiedProcessMetrics = StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? 18 : 4;
         final int numberOfModifiedForwardMetrics = StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? 8 : 0;
+        final int numberOfSourceNodes = 4;
+        final int numberOfTerminalNodes = 4;
         checkMetricByName(listMetricProcessor, PROCESS_LATENCY_AVG, numberOfRemovedMetrics);
         checkMetricByName(listMetricProcessor, PROCESS_LATENCY_MAX, numberOfRemovedMetrics);
         checkMetricByName(listMetricProcessor, PUNCTUATE_LATENCY_AVG, numberOfRemovedMetrics);
@@ -600,6 +605,9 @@ public class MetricsIntegrationTest {
         checkMetricByName(listMetricProcessor, DESTROY_TOTAL, numberOfRemovedMetrics);
         checkMetricByName(listMetricProcessor, FORWARD_TOTAL, numberOfModifiedForwardMetrics);
         checkMetricByName(listMetricProcessor, FORWARD_RATE, numberOfModifiedForwardMetrics);
+        checkMetricByName(listMetricProcessor, RECORD_E2E_LATENCY_AVG, numberOfSourceNodes + numberOfTerminalNodes);
+        checkMetricByName(listMetricProcessor, RECORD_E2E_LATENCY_MIN, numberOfSourceNodes + numberOfTerminalNodes);
+        checkMetricByName(listMetricProcessor, RECORD_E2E_LATENCY_MAX, numberOfSourceNodes + numberOfTerminalNodes);
     }
 
     private void checkKeyValueStoreMetrics(final String group0100To24,
@@ -607,8 +615,9 @@ public class MetricsIntegrationTest {
                                            final String builtInMetricsVersion) {
         final List<Metric> listMetricStore = new ArrayList<Metric>(kafkaStreams.metrics().values()).stream()
             .filter(m -> m.metricName().tags().containsKey(tagKey) &&
-                m.metricName().group().equals(StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? group0100To24 : STATE_STORE_LEVEL_GROUP))
-            .collect(Collectors.toList());
+                (m.metricName().group().equals(group0100To24) || m.metricName().group().equals(STATE_STORE_LEVEL_GROUP))
+            ).collect(Collectors.toList());
+
         final int expectedNumberOfLatencyMetrics = StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? 2 : 1;
         final int expectedNumberOfRateMetrics = StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? 2 : 1;
         final int expectedNumberOfTotalMetrics = StreamsConfig.METRICS_0100_TO_24.equals(builtInMetricsVersion) ? 2 : 0;
@@ -662,6 +671,9 @@ public class MetricsIntegrationTest {
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_CURRENT, 0);
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_AVG, 0);
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_MAX, 0);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_AVG, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_MIN, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_MAX, 1);
     }
 
     private void checkMetricsDeregistration() {
@@ -755,6 +767,9 @@ public class MetricsIntegrationTest {
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_CURRENT, expectedNumberOfRemovedMetrics);
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_AVG, 1);
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_MAX, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_AVG, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_MIN, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_MAX, 1);
     }
 
     private void checkSessionStoreMetrics(final String builtInMetricsVersion) {
@@ -820,6 +835,9 @@ public class MetricsIntegrationTest {
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_CURRENT, 0);
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_AVG, 0);
         checkMetricByName(listMetricStore, SUPPRESSION_BUFFER_SIZE_MAX, 0);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_AVG, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_MIN, 1);
+        checkMetricByName(listMetricStore, RECORD_E2E_LATENCY_MAX, 1);
     }
 
     private void checkMetricByName(final List<Metric> listMetric, final String metricName, final int numMetric) {

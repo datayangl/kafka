@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import java.io.Closeable;
 import java.nio.ByteBuffer;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
@@ -47,7 +48,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.HashSet;
 
-public class SslFactory implements Reconfigurable {
+public class SslFactory implements Reconfigurable, Closeable {
     private static final Logger log = LoggerFactory.getLogger(SslFactory.class);
 
     private final Mode mode;
@@ -115,6 +116,7 @@ public class SslFactory implements Reconfigurable {
     public void reconfigure(Map<String, ?> newConfigs) throws KafkaException {
         SslEngineFactory newSslEngineFactory = createNewSslEngineFactory(newConfigs);
         if (newSslEngineFactory != this.sslEngineFactory) {
+            Utils.closeQuietly(this.sslEngineFactory, "close stale ssl engine factory");
             this.sslEngineFactory = newSslEngineFactory;
             log.info("Created new {} SSL engine builder with keystore {} truststore {}", mode,
                     newSslEngineFactory.keystore(), newSslEngineFactory.truststore());
@@ -160,10 +162,8 @@ public class SslFactory implements Reconfigurable {
                     throw new ConfigException("Cannot remove the SSL keystore from an existing listener for " +
                             "which a keystore was configured.");
                 }
-                if (!CertificateEntries.create(sslEngineFactory.keystore()).equals(
-                        CertificateEntries.create(newSslEngineFactory.keystore()))) {
-                    throw new ConfigException("Keystore DistinguishedName or SubjectAltNames do not match");
-                }
+
+                CertificateEntries.ensureCompatible(newSslEngineFactory.keystore(), sslEngineFactory.keystore());
             }
             if (sslEngineFactory.truststore() == null && newSslEngineFactory.truststore() != null) {
                 throw new ConfigException("Cannot add SSL truststore to an existing listener for which no " +
@@ -230,7 +230,13 @@ public class SslFactory implements Reconfigurable {
         }
     }
 
+    @Override
+    public void close() {
+        Utils.closeQuietly(sslEngineFactory, "close engine factory");
+    }
+
     static class CertificateEntries {
+        private final String alias;
         private final Principal subjectPrincipal;
         private final Set<List<?>> subjectAltNames;
 
@@ -241,12 +247,36 @@ public class SslFactory implements Reconfigurable {
                 String alias = aliases.nextElement();
                 Certificate cert  = keystore.getCertificate(alias);
                 if (cert instanceof X509Certificate)
-                    entries.add(new CertificateEntries((X509Certificate) cert));
+                    entries.add(new CertificateEntries(alias, (X509Certificate) cert));
             }
             return entries;
         }
 
-        CertificateEntries(X509Certificate cert) throws GeneralSecurityException {
+        static void ensureCompatible(KeyStore newKeystore, KeyStore oldKeystore) throws GeneralSecurityException {
+            List<CertificateEntries> newEntries = CertificateEntries.create(newKeystore);
+            List<CertificateEntries> oldEntries = CertificateEntries.create(oldKeystore);
+            if (newEntries.size() != oldEntries.size()) {
+                throw new ConfigException(String.format("Keystore entries do not match, existing store contains %d entries, new store contains %d entries",
+                    oldEntries.size(), newEntries.size()));
+            }
+            for (int i = 0; i < newEntries.size(); i++) {
+                CertificateEntries newEntry = newEntries.get(i);
+                CertificateEntries oldEntry = oldEntries.get(i);
+                if (!Objects.equals(newEntry.subjectPrincipal, oldEntry.subjectPrincipal)) {
+                    throw new ConfigException(String.format("Keystore DistinguishedName does not match: " +
+                        " existing={alias=%s, DN=%s}, new={alias=%s, DN=%s}",
+                        oldEntry.alias, oldEntry.subjectPrincipal, newEntry.alias, newEntry.subjectPrincipal));
+                }
+                if (!newEntry.subjectAltNames.containsAll(oldEntry.subjectAltNames)) {
+                    throw new ConfigException(String.format("Keystore SubjectAltNames do not match: " +
+                            " existing={alias=%s, SAN=%s}, new={alias=%s, SAN=%s}",
+                        oldEntry.alias, oldEntry.subjectAltNames, newEntry.alias, newEntry.subjectAltNames));
+                }
+            }
+        }
+
+        CertificateEntries(String alias, X509Certificate cert) throws GeneralSecurityException {
+            this.alias = alias;
             this.subjectPrincipal = cert.getSubjectX500Principal();
             Collection<List<?>> altNames = cert.getSubjectAlternativeNames();
             // use a set for comparison

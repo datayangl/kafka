@@ -69,11 +69,17 @@ class Pool[K,V](valueFactory: Option[K => V] = None) extends Iterable[(K, V)] {
 
   def remove(key: K, value: V): Boolean = pool.remove(key, value)
 
+  def removeAll(keys: Iterable[K]): Unit = pool.keySet.removeAll(keys.asJavaCollection)
+
   def keys: Set[K] = pool.keySet.asScala
 
   def values: Iterable[V] = pool.values.asScala
 
   def clear(): Unit = { pool.clear() }
+
+  def foreachEntry(f: (K, V) => Unit): Unit = {
+    pool.forEach((k, v) => f(k, v))
+  }
   
   override def size: Int = pool.size
   
